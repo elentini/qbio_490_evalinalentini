@@ -1,0 +1,198 @@
+---
+title: "Intro to Epigenomics"
+author: Wade Boohar
+date: 11/03/24
+updated: 03/07/24
+---
+
+
+```{r setup}
+knitr::opts_knit$set(root.dir = normalizePath("/home1/elentini/490_cluster/analysis_data"))
+
+methylation_clinical <- read.csv("/home1/elentini/490_cluster/analysis_data/brca_methylation_clinical.csv")
+
+betas <- read.csv("/home1/elentini/490_cluster/analysis_data/brca_methylation_betas.csv")
+
+cpg_sites <- read.csv("/home1/elentini/490_cluster/analysis_data/brca_cpg_sites.csv")
+```
+
+Package Download and Data-cleaning
+```{r}
+if (!require("sesameData", quietly = TRUE))
+BiocManager::install("sesameData")
+
+if (!require("sesame", quietly = TRUE))
+BiocManager::install("sesame")
+
+if (!require("limma", quietly = TRUE))
+BiocManager::install("limma")
+```
+
+
+Load in all necessary packages
+```{r}
+library(TCGAbiolinks)
+library(sesame)
+library(sesameData)
+library(limma)
+library(ggplot2)
+```
+
+
+```{r}
+methylation_clinical <- read.csv("brca_methylation_clinical.csv")
+betas <- read.csv("brca_methylation_betas.csv")
+cpg_sites <- read.csv("brca_cpg_sites.csv")
+
+column_mask <- ifelse(colnames(methylation_clinical) %in% c('treatments', 'primary_site', 'disease_type','sites_of_involvement'), F, T)
+
+methylation_clinical <- methylation_clinical[,column_mask]
+write.csv(methylation_clinical, 'brca_methylation_clinical.csv')
+
+
+site_mask <- !grepl('-', cpg_sites$gene) & !grepl(';', cpg_sites$gene) & !is.na(cpg_sites$gene) & complete.cases(betas)
+betas <- betas[site_mask,]
+cpg_sites <- cpg_sites[site_mask,]
+
+write.csv(betas, 'brca_methylation_betas.csv')
+write.csv(cpg_sites, 'brca_cpg_sites.csv')
+```
+
+```{r}
+methylation_clinical <- read.csv("brca_methylation_clinical.csv", row.names = 1)
+
+betas <- read.csv("brca_methylation_betas.csv", row.names = 1)
+
+cpg_sites <- read.csv("brca_cpg_sites.csv", row.names = 1)
+betas <- betas[, !(colnames(betas) %in% c("X", "X.1", "X.2", "X.3"))]
+```
+
+^^^Used AI and google search to aid in line 67 because I couldn't figure out why I was getting 899 instead of 895 but looked in the data and saw the row names didn't run correctly previously and I knew I needed to delete those columns but didn't know how.
+
+(1) Naive Differential Methylation
+```{r}
+#masking out NAs
+na_mask <- !is.na(methylation_clinical$age_at_diagnosis)
+methylation_clinical <- methylation_clinical[na_mask,]
+betas_clean <- betas[,na_mask]
+
+median <- median(methylation_clinical$age_at_diagnosis)
+
+methylation_clinical$age_category <- ifelse(methylation_clinical$age_at_diagnosis >= median, "old", "young")
+
+#fitting linear models using a "target value"
+young_mask <- methylation_clinical$age_category == "young"
+
+methylation_clinical$ages <- !young_mask
+
+betas_clean <- betas_clean[, sapply(betas_clean, is.numeric)]
+mval <- t(apply(betas_clean, 1, function(x) log2(x/(1-x)))) 
+#mvalue is another statistic for methylation, centered at 0 and ranges from -1 to 1
+
+design <- model.matrix(~ ages, data = methylation_clinical)
+fit <- lmFit(mval, design)
+fit2 <- eBayes(fit)
+```
+
+```{r}
+#Extracting model into dataframe
+dat <- data.frame(foldchange = fit[["coefficients"]][,2], logPvalue =  -log10(p.adjust(fit2[["p.value"]][,2],method='BY')), geneName = cpg_sites$gene)
+dat$threshold <- as.factor(abs(dat$foldchange) < 1)
+
+#Visualization
+cols <- c("TRUE" = "grey", "FALSE" = "blue")
+ggplot(data=dat, aes(x=foldchange, y = logPvalue, color=threshold)) +
+  geom_point(alpha=.2, size=0.6) +
+  scale_colour_manual(values = cols) +
+  geom_vline(xintercept = 1, colour="#990000", linetype="dashed") + 
+  geom_vline(xintercept = - 1, colour="#990000", linetype="dashed") +
+  geom_hline(yintercept = 2, colour = "#990000", linetype="dashed") +
+  theme(legend.position="none") +
+  xlab("Fold Change") +
+  ylab("-log10 p value") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+The volcano plot shows which CpG sites differ in methylation levels between metastatic and non-metastatic breast cancer samples. Most CpG sites cluster near zero on the x-axis, meaning they have little or no change, while a smaller group surpasses the significance and fold-change thresholds, suggesting potentially meaningful methylation differences between the two conditions. From this, you can conclude that there are candidate CpG sites whose methylation levels differ across metastasis status. However, you cannot conclude why those differences occur or whether they have any effect on gene expression or tumor behavior, since this plot only reflects statistical associations and does not account for confounding biological factors.
+
+
+(2) Direct comparison of methylation status to transcriptional activity
+
+#...INSERT DESeq2 Stuff here to generate 'results'...
+```{r}
+library(DESeq2)
+rna_query <- GDCquery(
+   project = "TCGA-SKCM",
+   data.category = "Transcriptome Profiling",
+   data.type = "Gene Expression Quantification",
+   workflow.type = "STAR - Counts"
+)
+
+GDCdownload(rna_query)
+rna_se <- GDCprepare(rna_query)
+
+rna_clinical <- as.data.frame(rna_se@colData)
+rna_counts   <- as.data.frame(assay(rna_se))
+rna_genes    <- as.data.frame(rowData(rna_se))
+
+keep_status <- rna_clinical$definition %in% c("Primary solid Tumor", "Metastatic")
+rna_clinical <- rna_clinical[keep_status, ]
+rna_counts <- rna_counts[, keep_status]
+
+gene_totals <- rowSums(rna_counts)
+keep_genes <- gene_totals >= 20
+rna_counts <- rna_counts[keep_genes, ]
+rna_genes  <- rna_genes[keep_genes, ]
+
+dds <- DESeqDataSetFromMatrix(
+  countData = rna_counts,
+  colData = rna_clinical,
+  design = ~ definition
+)
+
+dds <- DESeq(dds)
+
+results <- as.data.frame(results(dds))
+results$gene_name <- rna_genes$gene_name
+```
+
+```{r}
+#you can also try looking at "upregulated" or "hypermethylated" !
+downregulated <- results[(results$log2FoldChange < 3), 'gene_name']
+hypomethylated <- dat[dat$foldchange < -1, 'geneName']
+interest_genes <- intersect(downregulated, hypomethylated)
+```
+
+
+(Extra) Making Boxplots
+```{r}
+GENE<-"SCTR"
+
+gene_counts_mask <- rna_genes$gene_name == GENE
+gene_betas_mask <- cpg_sites$gene == GENE
+
+rna_clinical_tumor <- rna_clinical$definition == "Primary solid Tumor"
+methylation_clinical_tumor <- methylation_clinical$definition == "Primary solid Tumor"
+
+rna_clinical_normal <- rna_clinical$definition == "Solid Tissue Normal"
+methylation_clinical_normal <- methylation_clinical$definition == "Solid Tissue Normal"
+
+rna_tumor <- as.numeric(rna_counts[gene_counts_mask, rna_clinical_tumor])
+methylation_tumor <- (betas[gene_betas_mask, methylation_clinical_tumor])
+
+rna_normal <- as.numeric(rna_counts[gene_counts_mask, rna_clinical_normal])
+methylation_normal <- (betas[gene_betas_mask, methylation_clinical_normal])
+```
+
+```{r}
+boxplot(rna_normal, rna_tumor, xlab='Group', ylab='Counts', names=c('Normal', 'Tumor'))
+```
+
+The boxplot comparing metastatic and non-metastatic samples shows that metastatic samples generally have higher RNA expression levels. This suggests that the genes being analyzed are more transcriptionally active in metastatic tumors, possibly reflecting changes that promote cancer spread. These differences could be related to reduced methylation at regulatory CpG sites, which can allow greater gene expression. However, this result only shows a correlation, not proof that methylation directly causes the increase in transcription. Other factors, such as altered signaling pathways or transcription-factor activity, may also contribute.
+
+In the UCSC genome browser, ERK (MAPK3), MAPK1, and FOSL1 all show distinct but related expression patterns that connect to known cancer pathways. MAPK3 and MAPK1 are widely expressed across many tissue types, especially in the brain and epithelial tissues, consistent with their roles in cellular signaling and growth control. FOSL1, however, shows more tissue-specific expression, with the highest levels in fibroblasts and epithelial-related tissues, which supports its role as a transcription factor driving proliferation and tumor progression. These patterns align with the reasoning similar to my dataset, where metastatic samples showed increased transcriptional activity and lower methylation for something like FOSL1, suggesting that its activation may contribute to cancer spread.
+
+This conclusion is supported by Luo et al. (2018, European Review for Medical and Pharmacological Sciences, PMID: 30575900), who found that FOSL1 enhances the growth and metastasis of human prostate cancer cells by regulating the epithelial-mesenchymal transition (EMT) pathway. Their study confirmed that high FOSL1 expression increased N-cadherin and Snail1 levels while decreasing E-cadherin, leading to more aggressive and invasive cancer phenotypes. I chose this paper because it closely connects to our final project and highlights how the same genes we analyzed, particularly FOSL1, are commonly upregulated in prostate cancer and act through the same EMT mechanism reflected in our methylation and expression trends. 
+
+Luo YZ, He P, Qiu MX. FOSL1 enhances growth and metastasis of human prostate cancer cells through epithelial mesenchymal transition pathway. Eur Rev Med Pharmacol Sci. 2018 Dec;22(24):8609-8615. doi: 10.26355/eurrev_201812_16624. PMID: 30575900.
+
